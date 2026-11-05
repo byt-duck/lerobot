@@ -169,9 +169,9 @@ def inspect_training_example(episode_id: int, anchor: int = 0) -> None:
         raise IndexError(
             f"anchor must be between 0 and {len(dataset) - 1}; got {anchor}"
         )
-
+    print(f"DATASET SHRAYA DEBUG: {len(dataset)=}")
     example = dataset[anchor]
-    print(f"SHRAYA DEBUG: {example=}")
+    print(f"EXAMPLE SHRAYA DEBUG: {example=}")
 
     # x: information available to the policy at the anchor timestep.
     x = {
@@ -247,7 +247,7 @@ def main() -> None:
     print("Episode IDs:", episode_ids)
 
     # Inspect the first demonstration for this task.
-    inspect_episode(episode_ids[0])
+    # inspect_episode(episode_ids[0])
 
     # Inspect the first (x, y) pair from that same demonstration. Change
     # anchor to inspect a different timestep in the episode.
