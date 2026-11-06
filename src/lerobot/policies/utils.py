@@ -39,6 +39,10 @@ def populate_queues(
     for key in batch:
         # Ignore keys not in the queues already (leaving the responsibility to the caller to make sure the
         # queues have the keys they want).
+
+        #(duck): unsqueeze all to have time-dim
+        batch[key].unsqueeze_(1)
+
         if key not in queues or key in exclude_keys:
             continue
         if len(queues[key]) != queues[key].maxlen:

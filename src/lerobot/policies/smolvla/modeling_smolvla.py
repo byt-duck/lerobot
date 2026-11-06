@@ -61,7 +61,7 @@ import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 
 from lerobot.configs import FeatureType
-from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE, OBS_STR
 from lerobot.utils.import_utils import require_package
 
 from ..chunk import FeatureSpec
@@ -171,6 +171,11 @@ class SmolVLAPolicy(PreTrainedPolicy):
         """This should be called whenever the environment is reset."""
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
+            OBS_STATE: deque(maxlen=self.config.n_obs_steps),
+            **{
+                image_key: deque(maxlen=self.config.n_obs_steps)
+                for image_key in self.config.image_features
+            },
         }
 
     def init_rtc_processor(self):
@@ -206,7 +211,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         # on an empty container.
         for k in batch:
             if k in self._queues and k != ACTION:
-                batch[k] = torch.stack(list(self._queues[k]), dim=1)
+                batch[k] = torch.stack(list(self._queues[k]), dim=1) #[image1 -> (B, T, C, H, W), image2 -> (B, T, C, H, W), state -> (B, T, NUM)]
 
         images, img_masks = self.prepare_images(batch)
         state = self.prepare_state(batch)
@@ -276,7 +281,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         )
 
         self.eval()
-        batch = self._prepare_batch(batch)
+        batch = self._prepare_batch(batch) #unmodified
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
 
         if self._check_get_actions_condition():
