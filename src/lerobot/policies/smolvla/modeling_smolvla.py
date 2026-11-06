@@ -414,12 +414,35 @@ class SmolVLAPolicy(PreTrainedPolicy):
             # Normalize from range [0,1] to [-1,1] as expacted by siglip
             img = img * 2.0 - 1.0
 
-            bsize = img.shape[0]
+            bsize, num_obs = img.shape[:2]
             device = img.device
-            if f"{key}_padding_mask" in batch:
-                mask = batch[f"{key}_padding_mask"].bool()
+            # Dataset convention: True means this observation was padded.
+            is_pad_key = f"{key}_is_pad"
+
+            # Existing SmolVLA convention: True means this camera is valid.
+            camera_valid_key = f"{key}_padding_mask"
+
+            if is_pad_key in batch:
+                mask = ~batch[is_pad_key].to(device=device, dtype=torch.bool)
+            elif camera_valid_key in batch:
+                mask = batch[camera_valid_key].to(device=device, dtype=torch.bool)
             else:
-                mask = torch.ones(bsize, dtype=torch.bool, device=device)
+                mask = torch.ones(
+                    (bsize, num_obs),
+                    dtype=torch.bool,
+                    device=device,
+                )
+
+            # Support an existing camera-wide mask of shape (B,).
+            if mask.ndim == 1:
+                mask = mask[:, None].expand(-1, num_obs)
+
+            if mask.shape != (bsize, num_obs):
+                raise ValueError(
+                    f"Expected mask for {key} to have shape {(bsize, num_obs)}, "
+                    f"got {tuple(mask.shape)}"
+                )
+
             images.append(img)
             img_masks.append(mask)
 
@@ -630,8 +653,8 @@ class VLAFlowMatching(nn.Module):
         ) in enumerate(zip(images, img_masks, strict=False)):
             
             # (B, T, C, H, W) -> (B*T, C, H, W)
-            img = img.view(B*T, *img.shape[2:])
-            img_mask = img_mask.view(B*T, *img_mask.shape[2:])
+            img = img.reshape(B * T, *img.shape[2:])
+            img_mask = img_mask.reshape(B * T)
 
             if self.add_image_special_tokens: # false
                 image_start_token = (
