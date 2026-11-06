@@ -397,7 +397,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
             )
         # Preprocess image features present in the batch
         for key in present_img_keys:
-            img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
+            # (duck): v this is responsible for extracting only the most recent image timestep
+            # img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
+            img = batch[key] #(B, T, C, H, W)
             if img.dtype == torch.uint8:
                 img = img.to(torch.float32) / 255.0
             if self.config.resize_imgs_with_padding is not None:
@@ -461,7 +463,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
     def prepare_state(self, batch):
         """Pad state"""
-        state = batch[OBS_STATE][:, -1, :] if batch[OBS_STATE].ndim > 2 else batch[OBS_STATE]
+        #(duck): v this is responsible for extracting the most recent observation timestep
+        # state = batch[OBS_STATE][:, -1, :] if batch[OBS_STATE].ndim > 2 else batch[OBS_STATE]
+        state = batch[OBS_STATE]
         state = pad_vector(state, self.config.max_state_dim)
         return state
 
@@ -607,6 +611,16 @@ class VLAFlowMatching(nn.Module):
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for SmolVLM transformer processing.
         """
+
+        #(duck)
+        # -> prev: images = [(B, C, H, W) - camera1, (B, C, H, W) - camera2], state = (B, SDIM)
+        # -> now: [(B, T, C, H, W) - camera1, (B, T, C, H, W) - camera2], state = (B, T, SDIM)
+
+        # vision enc -> flatten along 1st dim for independent encoding
+        # vlm inp -> regroup original batch, concatentate visual tokens along 2nd dim
+            # -> grouping? [t0_camera1, t0_camera_2, ..., tn_camera1, tn_camera2]
+
+        B, T, _, _, _ = images[0].shape
         embs = []
         pad_masks = []
         att_masks = []
@@ -614,7 +628,12 @@ class VLAFlowMatching(nn.Module):
             img,
             img_mask,
         ) in enumerate(zip(images, img_masks, strict=False)):
-            if self.add_image_special_tokens:
+            
+            # (B, T, C, H, W) -> (B*T, C, H, W)
+            img = img.view(B*T, *img.shape[2:])
+            img_mask = img_mask.view(B*T, *img_mask.shape[2:])
+
+            if self.add_image_special_tokens: # false
                 image_start_token = (
                     self.vlm_with_expert.embed_language_tokens(
                         self.global_image_start_token.to(device=self.vlm_with_expert.vlm.device)
@@ -629,7 +648,7 @@ class VLAFlowMatching(nn.Module):
                 embs.append(image_start_token)
                 pad_masks.append(image_start_mask)
 
-            img_emb = self.vlm_with_expert.embed_image(img)
+            img_emb = self.vlm_with_expert.embed_image(img) #(B*T, VT, D): VT=visual toks/image, D=SmolVLM2 emb dim
             img_emb = img_emb
 
             # Normalize image embeddings
@@ -642,8 +661,8 @@ class VLAFlowMatching(nn.Module):
             embs.append(img_emb)
             pad_masks.append(img_mask)
 
-            att_masks += [0] * (num_img_embs)
-            if self.add_image_special_tokens:
+            #att_masks += [0] * (num_img_embs)
+            if self.add_image_special_tokens: #false
                 image_end_token = (
                     self.vlm_with_expert.embed_language_tokens(
                         self.image_end_token.to(device=self.vlm_with_expert.vlm.device)
@@ -657,6 +676,26 @@ class VLAFlowMatching(nn.Module):
                 embs.append(image_end_token)
                 pad_masks.append(image_end_mask)
                 att_masks += [0] * (image_end_mask.shape[1])
+
+        # do the dim-2 grouping
+        # embs? [(B*T, VT, D) - camera1, (B*T, VT, D) - camera2]
+        K = len(embs) # num cameras
+        VT, D = embs[0].shape[1:]
+
+        visual_embs = torch.stack(embs, dim=1) #(B*T, K, VT, D)
+        visual_pad_masks = torch.stack(pad_masks, dim=1)
+
+        visual_embs = visual_embs.reshape(B, T, K, VT, D) #(B, T, K, VT, D)
+        visual_pad_masks = visual_pad_masks.reshape(B, T, K, VT)
+
+        visual_embs = visual_embs.flatten(1, 3) #(B, T*K*VT, D)
+        visual_pad_masks = visual_pad_masks.flatten(1, 3)
+
+        embs = [visual_embs]
+        pad_masks = [visual_pad_masks]
+
+        att_masks = [0] * visual_embs.shape[1]
+            
         lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
         # Normalize language embeddings
         lang_emb_dim = lang_emb.shape[-1]
@@ -668,7 +707,7 @@ class VLAFlowMatching(nn.Module):
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
-        state_emb = self.state_proj(state)
+        state_emb = self.state_proj(state) #(B, T, D) already
         state_emb = state_emb[:, None, :] if state_emb.ndim == 2 else state_emb
         embs.append(state_emb)
         bsize = state_emb.shape[0]

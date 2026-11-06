@@ -152,7 +152,9 @@ class SmolVLAConfig(PreTrainedConfig):
 
     @property
     def observation_delta_indices(self) -> list:
-        return [0]
+        # return [0]
+        #(duck):
+        return [-1 * i for i in range(self.n_obs_steps)].reverse()
 
     @property
     def action_delta_indices(self) -> list:

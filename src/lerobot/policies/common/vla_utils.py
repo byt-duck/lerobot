@@ -214,7 +214,7 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
 
     return padded_images
 
-
+# (duck) -> support for 5d image resizing
 def resize_with_pad(img: torch.Tensor, height: int, width: int, *, pad_value: float) -> torch.Tensor:
     """Resize a (b, c, h, w) image without distortion, padding on the LEFT and TOP.
 
@@ -222,8 +222,9 @@ def resize_with_pad(img: torch.Tensor, height: int, width: int, *, pad_value: fl
     :func:`resize_with_pad_torch`. ``pad_value`` is keyword-only on purpose: callers
     historically used different values (0, -1) and must state their choice explicitly.
     """
-    if img.ndim != 4:
-        raise ValueError(f"(b,c,h,w) expected, but got {img.shape}")
+    # (B, T, C, H, W) -> (B*T, C, H, W)
+    B, T, C, H, W = img.shape
+    img = img.view(B*T, C, H, W)
 
     current_height, current_width = img.shape[2:]
     if current_height == height and current_width == width:
@@ -239,4 +240,6 @@ def resize_with_pad(img: torch.Tensor, height: int, width: int, *, pad_value: fl
     pad_height = max(0, height - resized_height)
     pad_width = max(0, width - resized_width)
     padded_img = F.pad(resized_img, (pad_width, 0, pad_height, 0), value=pad_value)
-    return padded_img
+
+    #(B*T, C, H, W) -> (B, T, C, H, W)
+    return padded_img.reshape(B, T, C, height, width)
