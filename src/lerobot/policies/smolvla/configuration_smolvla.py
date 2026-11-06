@@ -111,6 +111,8 @@ class SmolVLAConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
+        if self.n_obs_steps < 1:
+            raise ValueError(f"n_obs_steps must be at least 1, got {self.n_obs_steps}.")
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "

@@ -80,9 +80,7 @@ from ..common.vla_utils import (
 )
 from ..pretrained import PreTrainedPolicy, RTCActionSelectKwargs
 from ..rtc.modeling_rtc import RTCProcessor
-from ..utils import (
-    populate_queues,
-)
+from ..utils import populate_queues
 from .configuration_smolvla import SmolVLAConfig
 from .smolvlm_with_expert import SmolVLMWithExpertModel
 
@@ -216,7 +214,13 @@ class SmolVLAPolicy(PreTrainedPolicy):
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.model.sample_actions(
-            images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            noise=noise,
+            **kwargs,
         )
 
         # Unpad actions
@@ -312,13 +316,23 @@ class SmolVLAPolicy(PreTrainedPolicy):
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
 
         images, img_masks = self.prepare_images(batch)
-        state = self.prepare_state(batch)
+        state, state_mask = self.prepare_state_history(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("action_is_pad")
         loss_dict: dict[str, float] = {}
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        losses = self.model.forward(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            actions,
+            noise,
+            time,
+            state_mask=state_mask,
+        )
         action_feature = self.config.action_feature
         if action_feature is None:
             raise ValueError("SmolVLA requires an action output feature.")
@@ -397,24 +411,34 @@ class SmolVLAPolicy(PreTrainedPolicy):
             )
         # Preprocess image features present in the batch
         for key in present_img_keys:
-            # (duck): v this is responsible for extracting only the most recent image timestep
-            # img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
-            img = batch[key] #(B, T, C, H, W)
+            img = batch[key]  # (B, T, C, H, W)
+            if img.ndim != 5:
+                raise ValueError(
+                    f"Expected training history {key} to have shape (B,T,C,H,W), got {tuple(img.shape)}."
+                )
+
+            bsize, num_obs = img.shape[:2]
+            if num_obs != self.config.n_obs_steps:
+                raise ValueError(f"Expected {self.config.n_obs_steps} observations for {key}, got {num_obs}.")
+
             if img.dtype == torch.uint8:
                 img = img.to(torch.float32) / 255.0
             if self.config.resize_imgs_with_padding is not None:
                 # SmolVLA stores the target as (width, height); the shared helper expects (height, width).
-                img = resize_with_pad(
-                    img,
+                # (duck) -> support for 5d image resizing
+                # (B, T, C, H, W) -> (B*T, C, H, W)
+                flat_img = resize_with_pad(
+                    img.flatten(0, 1),
                     self.config.resize_imgs_with_padding[1],
                     self.config.resize_imgs_with_padding[0],
                     pad_value=0,
                 )
+                #(B*T, C, H, W) -> (B, T, C, H, W)
+                img = flat_img.unflatten(0, (bsize, num_obs))
 
-            # Normalize from range [0,1] to [-1,1] as expacted by siglip
+            # Normalize from range [0,1] to [-1,1] as expected by SigLIP.
             img = img * 2.0 - 1.0
 
-            bsize, num_obs = img.shape[:2]
             device = img.device
             # Dataset convention: True means this observation was padded.
             is_pad_key = f"{key}_is_pad"
@@ -422,25 +446,22 @@ class SmolVLAPolicy(PreTrainedPolicy):
             # Existing SmolVLA convention: True means this camera is valid.
             camera_valid_key = f"{key}_padding_mask"
 
+            mask = torch.ones((bsize, num_obs), dtype=torch.bool, device=device)
             if is_pad_key in batch:
-                mask = ~batch[is_pad_key].to(device=device, dtype=torch.bool)
-            elif camera_valid_key in batch:
-                mask = batch[camera_valid_key].to(device=device, dtype=torch.bool)
-            else:
-                mask = torch.ones(
-                    (bsize, num_obs),
-                    dtype=torch.bool,
-                    device=device,
-                )
-
-            # Support an existing camera-wide mask of shape (B,).
-            if mask.ndim == 1:
-                mask = mask[:, None].expand(-1, num_obs)
+                temporal_mask = ~batch[is_pad_key].to(device=device, dtype=torch.bool)
+                if temporal_mask.ndim == 1:
+                    temporal_mask = temporal_mask[:, None].expand(-1, num_obs)
+                mask &= temporal_mask
+            if camera_valid_key in batch:
+                camera_mask = batch[camera_valid_key].to(device=device, dtype=torch.bool)
+                # Support an existing camera-wide mask of shape (B,).
+                if camera_mask.ndim == 1:
+                    camera_mask = camera_mask[:, None].expand(-1, num_obs)
+                mask &= camera_mask
 
             if mask.shape != (bsize, num_obs):
                 raise ValueError(
-                    f"Expected mask for {key} to have shape {(bsize, num_obs)}, "
-                    f"got {tuple(mask.shape)}"
+                    f"Expected mask for {key} to have shape {(bsize, num_obs)}, got {tuple(mask.shape)}"
                 )
 
             images.append(img)
@@ -460,10 +481,10 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def _pi_aloha_decode_state(self, state):
         # Flip the joints.
         for motor_idx in [1, 2, 8, 9]:
-            state[:, motor_idx] *= -1
+            state[..., motor_idx] *= -1
         # Reverse the gripper transformation that is being applied by the Aloha runtime.
         for motor_idx in [6, 13]:
-            state[:, motor_idx] = aloha_gripper_to_angular(state[:, motor_idx])
+            state[..., motor_idx] = aloha_gripper_to_angular(state[..., motor_idx])
         return state
 
     def _pi_aloha_encode_actions(self, actions):
@@ -485,12 +506,32 @@ class SmolVLAPolicy(PreTrainedPolicy):
         return actions
 
     def prepare_state(self, batch):
-        """Pad state"""
-        #(duck): v this is responsible for extracting the most recent observation timestep
-        # state = batch[OBS_STATE][:, -1, :] if batch[OBS_STATE].ndim > 2 else batch[OBS_STATE]
+        """Pad the final state feature dimension."""
         state = batch[OBS_STATE]
-        state = pad_vector(state, self.config.max_state_dim)
-        return state
+        return pad_vector(state, self.config.max_state_dim)
+
+    def prepare_state_history(self, batch):
+        """Pad training state histories and return their temporal validity mask."""
+        state = pad_vector(batch[OBS_STATE], self.config.max_state_dim)
+        if state.ndim != 3:
+            raise ValueError(
+                f"Expected training state history to have shape (B,T,D), got {tuple(state.shape)}."
+            )
+        if state.shape[1] != self.config.n_obs_steps:
+            raise ValueError(f"Expected {self.config.n_obs_steps} state observations, got {state.shape[1]}.")
+
+        pad_key = f"{OBS_STATE}_is_pad"
+        if pad_key in batch:
+            state_mask = ~batch[pad_key].to(device=state.device, dtype=torch.bool)
+            if state_mask.ndim == 1:
+                state_mask = state_mask[:, None].expand(-1, state.shape[1])
+        else:
+            state_mask = torch.ones(state.shape[:2], dtype=torch.bool, device=state.device)
+        if state_mask.shape != state.shape[:2]:
+            raise ValueError(
+                f"Expected state mask to have shape {tuple(state.shape[:2])}, got {tuple(state_mask.shape)}."
+            )
+        return state, state_mask
 
     def prepare_action(self, batch):
         """Pad action"""
@@ -629,7 +670,13 @@ class VLAFlowMatching(nn.Module):
         return sample_time_beta(bsize, device, alpha=1.5, beta=1.0, scale=0.999, offset=0.001)
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state: torch.Tensor,
+        state_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for SmolVLM transformer processing.
@@ -643,18 +690,22 @@ class VLAFlowMatching(nn.Module):
         # vlm inp -> regroup original batch, concatentate visual tokens along 2nd dim
             # -> grouping? [t0_camera1, t0_camera_2, ..., tn_camera1, tn_camera2]
 
-        B, T, _, _, _ = images[0].shape
-        embs = []
-        pad_masks = []
-        att_masks = []
-        for _img_idx, (
-            img,
-            img_mask,
-        ) in enumerate(zip(images, img_masks, strict=False)):
-            
+        batch_size, num_obs = images[0].shape[:2]
+        camera_embs = []
+        camera_pad_masks = []
+        for img, img_mask in zip(images, img_masks, strict=True):
+            if img.shape[:2] != (batch_size, num_obs):
+                raise ValueError("All camera tensors must have the same batch and history dimensions.")
+            if img_mask.shape != (batch_size, num_obs):
+                raise ValueError(
+                    f"Expected image mask shape {(batch_size, num_obs)}, got {tuple(img_mask.shape)}."
+                )
+
             # (B, T, C, H, W) -> (B*T, C, H, W)
-            img = img.reshape(B * T, *img.shape[2:])
-            img_mask = img_mask.reshape(B * T)
+            img = img.reshape(batch_size * num_obs, *img.shape[2:])
+            frame_mask = img_mask.reshape(batch_size * num_obs)
+            per_camera_embs = []
+            per_camera_masks = []
 
             if self.add_image_special_tokens: # false
                 image_start_token = (
@@ -664,27 +715,21 @@ class VLAFlowMatching(nn.Module):
                     .unsqueeze(0)
                     .expand(img.shape[0], -1, -1)
                 )
-                image_start_mask = torch.ones_like(
-                    image_start_token[:, :, 0], dtype=torch.bool, device=image_start_token.device
-                )
-                att_masks += [0] * (image_start_mask.shape[-1])
-                embs.append(image_start_token)
-                pad_masks.append(image_start_mask)
+                image_start_mask = frame_mask[:, None].expand(-1, image_start_token.shape[1])
+                per_camera_embs.append(image_start_token)
+                per_camera_masks.append(image_start_mask)
 
-            img_emb = self.vlm_with_expert.embed_image(img) #(B*T, VT, D): VT=visual toks/image, D=SmolVLM2 emb dim
-            img_emb = img_emb
+            img_emb = self.vlm_with_expert.embed_image(img)  #(B*T, VT, D): VT=visual toks/image, D=SmolVLM2 emb dim
 
             # Normalize image embeddings
             img_emb_dim = img_emb.shape[-1]
             img_emb = img_emb * torch.tensor(img_emb_dim**0.5, dtype=img_emb.dtype, device=img_emb.device)
 
-            bsize, num_img_embs = img_emb.shape[:2]
-            img_mask = img_mask[:, None].expand(bsize, num_img_embs)
+            num_img_embs = img_emb.shape[1]
+            visual_token_mask = frame_mask[:, None].expand(-1, num_img_embs)
+            per_camera_embs.append(img_emb)
+            per_camera_masks.append(visual_token_mask)
 
-            embs.append(img_emb)
-            pad_masks.append(img_mask)
-
-            #att_masks += [0] * (num_img_embs)
             if self.add_image_special_tokens: #false
                 image_end_token = (
                     self.vlm_with_expert.embed_language_tokens(
@@ -693,32 +738,32 @@ class VLAFlowMatching(nn.Module):
                     .unsqueeze(0)
                     .expand(img.shape[0], -1, -1)
                 )
-                image_end_mask = torch.ones_like(
-                    image_end_token[:, :, 0], dtype=torch.bool, device=image_end_token.device
-                )
-                embs.append(image_end_token)
-                pad_masks.append(image_end_mask)
-                att_masks += [0] * (image_end_mask.shape[1])
+                image_end_mask = frame_mask[:, None].expand(-1, image_end_token.shape[1])
+                per_camera_embs.append(image_end_token)
+                per_camera_masks.append(image_end_mask)
+
+            camera_embs.append(torch.cat(per_camera_embs, dim=1))
+            camera_pad_masks.append(torch.cat(per_camera_masks, dim=1))
 
         # do the dim-2 grouping
         # embs? [(B*T, VT, D) - camera1, (B*T, VT, D) - camera2]
-        K = len(embs) # num cameras
-        VT, D = embs[0].shape[1:]
+        num_cameras = len(camera_embs)  # num cameras
+        tokens_per_camera, embedding_dim = camera_embs[0].shape[1:]
+        visual_embs = torch.stack(camera_embs, dim=1)  #(B*T, K, VT, D)
+        visual_pad_masks = torch.stack(camera_pad_masks, dim=1)
 
-        visual_embs = torch.stack(embs, dim=1) #(B*T, K, VT, D)
-        visual_pad_masks = torch.stack(pad_masks, dim=1)
+        visual_embs = visual_embs.reshape(
+            batch_size, num_obs, num_cameras, tokens_per_camera, embedding_dim
+        )  #(B, T, K, VT, D)
+        visual_pad_masks = visual_pad_masks.reshape(batch_size, num_obs, num_cameras, tokens_per_camera)
 
-        visual_embs = visual_embs.reshape(B, T, K, VT, D) #(B, T, K, VT, D)
-        visual_pad_masks = visual_pad_masks.reshape(B, T, K, VT)
-
-        visual_embs = visual_embs.flatten(1, 3) #(B, T*K*VT, D)
+        visual_embs = visual_embs.flatten(1, 3)  #(B, T*K*VT, D)
         visual_pad_masks = visual_pad_masks.flatten(1, 3)
 
         embs = [visual_embs]
         pad_masks = [visual_pad_masks]
-
         att_masks = [0] * visual_embs.shape[1]
-            
+
         lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
         # Normalize language embeddings
         lang_emb_dim = lang_emb.shape[-1]
@@ -730,14 +775,21 @@ class VLAFlowMatching(nn.Module):
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
-        state_emb = self.state_proj(state) #(B, T, D) already
+        state_emb = self.state_proj(state)  #(B, T, D) already
         state_emb = state_emb[:, None, :] if state_emb.ndim == 2 else state_emb
         embs.append(state_emb)
         bsize = state_emb.shape[0]
         device = state_emb.device
 
         states_seq_len = state_emb.shape[1]
-        state_mask = torch.ones(bsize, states_seq_len, dtype=torch.bool, device=device)
+        if state_mask is None:
+            state_mask = torch.ones(bsize, states_seq_len, dtype=torch.bool, device=device)
+        else:
+            state_mask = state_mask.to(device=device, dtype=torch.bool)
+        if state_mask.shape != (bsize, states_seq_len):
+            raise ValueError(
+                f"Expected state mask shape {(bsize, states_seq_len)}, got {tuple(state_mask.shape)}."
+            )
         pad_masks.append(state_mask)
 
         # Set attention masks so that image and language inputs do not attend to state or actions
@@ -801,7 +853,16 @@ class VLAFlowMatching(nn.Module):
         return embs, pad_masks, att_masks
 
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        actions,
+        noise=None,
+        time=None,
+        state_mask=None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
@@ -812,7 +873,7 @@ class VLAFlowMatching(nn.Module):
 
         x_t, u_t, _ = make_flow_matching_inputs(actions, noise, time, convention=FlowConvention.NOISE_AT_ONE)
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images, img_masks, lang_tokens, lang_masks, state=state, state_mask=state_mask
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
 
