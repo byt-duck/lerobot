@@ -26,6 +26,12 @@ from ..rtc.configuration_rtc import RTCConfig
 class SmolVLAConfig(PreTrainedConfig):
     # Input / output structure.
     n_obs_steps: int = 1
+    # Memory (history) settings. n_obs_steps frames are used: n_obs_steps - 1 past frames + the current one.
+    # mem_stride: robot steps between consecutive history frames (1 = consecutive frames).
+    # mem_pool: average-pool factor on each PAST frame's image-token grid (1 = all tokens, 2 = 2x2 -> 1/4,
+    #           4 = 4x4 -> 1/16). The current frame is never pooled.
+    mem_stride: int = 1
+    mem_pool: int = 1
     chunk_size: int = 50
     n_action_steps: int = 50
 
@@ -113,6 +119,8 @@ class SmolVLAConfig(PreTrainedConfig):
         """Input validation (not exhaustive)."""
         if self.n_obs_steps < 1:
             raise ValueError(f"n_obs_steps must be at least 1, got {self.n_obs_steps}.")
+        if self.mem_stride < 1 or self.mem_pool not in (1, 2, 4, 8):
+            raise ValueError(f"bad memory settings mem_stride={self.mem_stride} mem_pool={self.mem_pool}")
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
@@ -156,7 +164,8 @@ class SmolVLAConfig(PreTrainedConfig):
     def observation_delta_indices(self) -> list:
         # return [0]
         #(duck):
-        return list(range(1 - self.n_obs_steps, 1))
+        # oldest first, current frame last: [-(T-1)*s, ..., -s, 0]
+        return [-(self.n_obs_steps - 1 - i) * self.mem_stride for i in range(self.n_obs_steps)]
 
     @property
     def action_delta_indices(self) -> list:

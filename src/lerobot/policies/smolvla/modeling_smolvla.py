@@ -80,7 +80,6 @@ from ..common.vla_utils import (
 )
 from ..pretrained import PreTrainedPolicy, RTCActionSelectKwargs
 from ..rtc.modeling_rtc import RTCProcessor
-from ..utils import populate_queues
 from .configuration_smolvla import SmolVLAConfig
 from .smolvlm_with_expert import SmolVLMWithExpertModel
 
@@ -172,6 +171,38 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+        # (chloe) eval-time observation history: last (T-1)*stride+1 frames per key, plus frames seen since reset
+        self._hist = {}
+        self._hist_count = 0
+
+    def _history_keys(self) -> list[str]:
+        return [*self.config.image_features, OBS_STATE]
+
+    def _push_history(self, batch: dict[str, Tensor]) -> None:
+        """Record the current observation (called once per environment step)."""
+        maxlen = (self.config.n_obs_steps - 1) * self.config.mem_stride + 1
+        for key in self._history_keys():
+            if key in batch:
+                self._hist.setdefault(key, deque(maxlen=maxlen)).append(batch[key])
+        self._hist_count += 1
+
+    def _history_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Build (B, T, ...) history tensors and (B, T) `_is_pad` masks exactly as LeRobotDataset does in
+        training: frames before the episode start are the episode's first frame, marked as padding."""
+        n_obs, stride, count = self.config.n_obs_steps, self.config.mem_stride, self._hist_count
+        batch = dict(batch)
+        for key in self._history_keys():
+            if key not in self._hist:
+                continue
+            frames = self._hist[key]
+            first_kept = count - len(frames)  # time index of frames[0]
+            wanted = [count - 1 - (n_obs - 1 - i) * stride for i in range(n_obs)]
+            picked = [frames[max(w, 0) - first_kept] for w in wanted]
+            batch[key] = torch.stack(picked, dim=1)
+            bsize = batch[key].shape[0]
+            is_pad = torch.tensor([w < 0 for w in wanted], dtype=torch.bool, device=batch[key].device)
+            batch[f"{key}_is_pad"] = is_pad[None, :].expand(bsize, -1)
+        return batch
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -204,12 +235,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
         # In the case of offline inference, we have the action in the batch
         # that why without the k != ACTION check, it will raise an error because we are trying to stack
         # on an empty container.
-        for k in batch:
-            if k in self._queues and k != ACTION:
-                batch[k] = torch.stack(list(self._queues[k]), dim=1)
-
+        # (chloe) the history (B, T, ...) is built by the caller from self._hist; see _history_batch
         images, img_masks = self.prepare_images(batch)
-        state = self.prepare_state(batch)
+        state, state_mask = self.prepare_state_history(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
@@ -220,6 +248,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             lang_masks,
             state,
             noise=noise,
+            state_mask=state_mask,
             **kwargs,
         )
 
@@ -251,9 +280,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self.eval()
 
         batch = self._prepare_batch(batch)
-        self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
+        self._push_history(batch)
 
-        actions = self._get_action_chunk(batch, noise=noise, **kwargs)
+        actions = self._get_action_chunk(self._history_batch(batch), noise=noise, **kwargs)
         return actions
 
     @torch.no_grad()
@@ -277,10 +306,10 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
         self.eval()
         batch = self._prepare_batch(batch)
-        self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
+        self._push_history(batch)  # every step, so history frames are robot steps even with open-loop chunks
 
         if self._check_get_actions_condition():
-            actions = self._get_action_chunk(batch, noise=noise)
+            actions = self._get_action_chunk(self._history_batch(batch), noise=noise)
 
             # `self.predict_action_chunk` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
@@ -745,20 +774,45 @@ class VLAFlowMatching(nn.Module):
             camera_embs.append(torch.cat(per_camera_embs, dim=1))
             camera_pad_masks.append(torch.cat(per_camera_masks, dim=1))
 
-        # do the dim-2 grouping
-        # embs? [(B*T, VT, D) - camera1, (B*T, VT, D) - camera2]
-        num_cameras = len(camera_embs)  # num cameras
-        tokens_per_camera, embedding_dim = camera_embs[0].shape[1:]
-        visual_embs = torch.stack(camera_embs, dim=1)  #(B*T, K, VT, D)
-        visual_pad_masks = torch.stack(camera_pad_masks, dim=1)
+        if self.config.mem_pool > 1 and num_obs > 1:
+            # (chloe) compressed memory: same order [t0_cam1, t0_cam2, ..., tn_cam1, tn_cam2], but each PAST
+            # frame's token grid is average-pooled by mem_pool x mem_pool; the current frame keeps all tokens.
+            if self.add_image_special_tokens:
+                raise ValueError("mem_pool > 1 is not supported with add_image_special_tokens")
+            pool = self.config.mem_pool
+            parts, part_masks = [], []
+            cams = [e.reshape(batch_size, num_obs, *e.shape[1:]) for e in camera_embs]  # (B, T, VT, D)
+            cam_masks = [m.reshape(batch_size, num_obs, m.shape[1]) for m in camera_pad_masks]
+            for t in range(num_obs):
+                for emb, msk in zip(cams, cam_masks, strict=True):
+                    x, xm = emb[:, t], msk[:, t]
+                    if t < num_obs - 1:
+                        n_tok, dim = x.shape[1:]
+                        side = int(n_tok**0.5)
+                        if side * side != n_tok or side % pool:
+                            raise ValueError(f"cannot pool {n_tok} image tokens by {pool}")
+                        grid = x.reshape(batch_size, side, side, dim).permute(0, 3, 1, 2)
+                        x = F.avg_pool2d(grid.float(), pool).to(x.dtype).flatten(2).transpose(1, 2)
+                        xm = xm[:, : x.shape[1]]
+                    parts.append(x)
+                    part_masks.append(xm)
+            visual_embs = torch.cat(parts, dim=1)
+            visual_pad_masks = torch.cat(part_masks, dim=1)
+        else:
+            # do the dim-2 grouping
+            # embs? [(B*T, VT, D) - camera1, (B*T, VT, D) - camera2]
+            num_cameras = len(camera_embs)  # num cameras
+            tokens_per_camera, embedding_dim = camera_embs[0].shape[1:]
+            visual_embs = torch.stack(camera_embs, dim=1)  #(B*T, K, VT, D)
+            visual_pad_masks = torch.stack(camera_pad_masks, dim=1)
 
-        visual_embs = visual_embs.reshape(
-            batch_size, num_obs, num_cameras, tokens_per_camera, embedding_dim
-        )  #(B, T, K, VT, D)
-        visual_pad_masks = visual_pad_masks.reshape(batch_size, num_obs, num_cameras, tokens_per_camera)
+            visual_embs = visual_embs.reshape(
+                batch_size, num_obs, num_cameras, tokens_per_camera, embedding_dim
+            )  #(B, T, K, VT, D)
+            visual_pad_masks = visual_pad_masks.reshape(batch_size, num_obs, num_cameras, tokens_per_camera)
 
-        visual_embs = visual_embs.flatten(1, 3)  #(B, T*K*VT, D)
-        visual_pad_masks = visual_pad_masks.flatten(1, 3)
+            visual_embs = visual_embs.flatten(1, 3)  #(B, T*K*VT, D)
+            visual_pad_masks = visual_pad_masks.flatten(1, 3)
 
         embs = [visual_embs]
         pad_masks = [visual_pad_masks]
@@ -904,6 +958,7 @@ class VLAFlowMatching(nn.Module):
         lang_masks,
         state,
         noise=None,
+        state_mask=None,
         **kwargs: Unpack[RTCActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
@@ -917,7 +972,7 @@ class VLAFlowMatching(nn.Module):
             noise = noise.to(device=device, dtype=torch.float32)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images, img_masks, lang_tokens, lang_masks, state=state, state_mask=state_mask
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
