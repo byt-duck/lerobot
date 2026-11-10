@@ -441,6 +441,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
         # Preprocess image features present in the batch
         for key in present_img_keys:
             img = batch[key]  # (B, T, C, H, W)
+            if img.ndim == 4 and self.config.n_obs_steps == 1:
+                img = img[:, None]  # (chloe) T=1: the dataset returns frames without a time axis
             if img.ndim != 5:
                 raise ValueError(
                     f"Expected training history {key} to have shape (B,T,C,H,W), got {tuple(img.shape)}."
@@ -542,6 +544,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def prepare_state_history(self, batch):
         """Pad training state histories and return their temporal validity mask."""
         state = pad_vector(batch[OBS_STATE], self.config.max_state_dim)
+        if state.ndim == 2 and self.config.n_obs_steps == 1:
+            state = state[:, None]  # (chloe) T=1: the dataset returns the state without a time axis
         if state.ndim != 3:
             raise ValueError(
                 f"Expected training state history to have shape (B,T,D), got {tuple(state.shape)}."
