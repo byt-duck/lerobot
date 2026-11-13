@@ -40,11 +40,12 @@ def populate_queues(
         # Ignore keys not in the queues already (leaving the responsibility to the caller to make sure the
         # queues have the keys they want).
 
-        #(duck): unsqueeze all to have time-dim
-        batch[key].unsqueeze_(1)
-
         if key not in queues or key in exclude_keys:
             continue
+
+        #(duck): unsqueeze all to have time-dim
+        # ~batch[key].unsqueeze_(1)~ -> torch.stack(dim=1) does this already
+        
         if len(queues[key]) != queues[key].maxlen:
             # initialize by copying the first observation several times until the queue is full
             while len(queues[key]) != queues[key].maxlen:

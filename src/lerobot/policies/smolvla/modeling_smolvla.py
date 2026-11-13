@@ -169,6 +169,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
     def reset(self):
         """This should be called whenever the environment is reset."""
+        self._observation_history_count = 0
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
             OBS_STATE: deque(maxlen=self.config.n_obs_steps),
@@ -213,8 +214,20 @@ class SmolVLAPolicy(PreTrainedPolicy):
             if k in self._queues and k != ACTION:
                 batch[k] = torch.stack(list(self._queues[k]), dim=1) #[image1 -> (B, T, C, H, W), image2 -> (B, T, C, H, W), state -> (B, T, NUM)]
 
+        state_history = batch[OBS_STATE]
+        num_state_steps = state_history.shape[1]
+        num_valid_state_steps = min(self._observation_history_count, num_state_steps)
+        state_is_pad = torch.arange(num_state_steps, device=state_history.device) < (
+            num_state_steps - num_valid_state_steps
+        )
+        history_is_pad = state_is_pad.unsqueeze(0).expand(state_history.shape[0], -1)
+        batch[f"{OBS_STATE}_is_pad"] = history_is_pad
+        for image_key in self.config.image_features:
+            if image_key in batch:
+                batch[f"{image_key}_is_pad"] = history_is_pad
+
         images, img_masks = self.prepare_images(batch)
-        state = self.prepare_state(batch)
+        state, state_mask = self.prepare_state_history(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
@@ -225,6 +238,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             lang_masks,
             state,
             noise=noise,
+            state_mask=state_mask,
             **kwargs,
         )
 
@@ -257,6 +271,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
         batch = self._prepare_batch(batch)
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
+        self._observation_history_count = min(
+            self._observation_history_count + 1, self.config.n_obs_steps
+        )
 
         actions = self._get_action_chunk(batch, noise=noise, **kwargs)
         return actions
@@ -283,6 +300,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self.eval()
         batch = self._prepare_batch(batch) #unmodified
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
+        self._observation_history_count = min(
+            self._observation_history_count + 1, self.config.n_obs_steps
+        )
 
         if self._check_get_actions_condition():
             actions = self._get_action_chunk(batch, noise=noise)
@@ -909,6 +929,7 @@ class VLAFlowMatching(nn.Module):
         lang_masks,
         state,
         noise=None,
+        state_mask=None,
         **kwargs: Unpack[RTCActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
@@ -922,7 +943,7 @@ class VLAFlowMatching(nn.Module):
             noise = noise.to(device=device, dtype=torch.float32)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images, img_masks, lang_tokens, lang_masks, state=state, state_mask=state_mask
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
