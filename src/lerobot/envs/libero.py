@@ -103,6 +103,11 @@ TASK_SUITE_MAX_STEPS: dict[str, int] = {
     "libero_90": 400,  # longest training demo has 373 steps
 }
 
+# LIBERO-Mem (libero-mem.github.io): fixed horizon per task = max(their TASK_LENGTHS,
+# longest held-out demo + 20), matching their eval, which runs the full horizon and
+# scores the checker's value at the last step.
+LIBERO_MEM_MAX_STEPS: dict[int, int] = {0: 200, 2: 360, 4: 485}
+
 
 class LiberoEnv(gym.Env):
     metadata = {"render_modes": ["rgb_array"], "render_fps": 80}
@@ -178,6 +183,11 @@ class LiberoEnv(gym.Env):
         task = task_suite.get_task(task_id)
         self.task = task.name
         self.task_description = task.language
+        # LIBERO-Mem: sequence goals ("... 3 times") need their stateful checker.
+        self._is_mem = task_suite_name == "libero_mem"
+        self._t = 0
+        if self._is_mem:
+            self.task_description = re.sub(r"^\d+ ", "", task.language)
         self._task_bddl_file = os.path.join(
             get_libero_path("bddl_files"), task.problem_folder, task.bddl_file
         )
@@ -187,7 +197,11 @@ class LiberoEnv(gym.Env):
 
         default_steps = 500
         self._max_episode_steps = (
-            TASK_SUITE_MAX_STEPS.get(task_suite_name, default_steps)
+            (
+                LIBERO_MEM_MAX_STEPS[self.task_id]
+                if self._is_mem
+                else TASK_SUITE_MAX_STEPS.get(task_suite_name, default_steps)
+            )
             if self.episode_length is None
             else self.episode_length
         )
@@ -344,6 +358,11 @@ class LiberoEnv(gym.Env):
         if self.init_states and self._init_states is not None:
             raw_obs = self._env.set_init_state(self._init_states[self.init_state_id % len(self._init_states)])
             self.init_state_id += self._reset_stride  # Change init_state_id when reset
+        if self._is_mem:
+            # Same order as their eval: set init state, clear subgoal progress, then settle.
+            self._env.env.reset_subgoal_progress()
+            self._env.env._overshot = False
+            self._t = 0
 
         # After reset, objects may be unstable (slightly floating, intersecting, etc.).
         # Step the simulator with a no-op action for a few frames so everything settles.
@@ -371,10 +390,18 @@ class LiberoEnv(gym.Env):
                 f"Expected action to be 1-D (shape (action_dim,)), "
                 f"but got shape {action.shape} with ndim={action.ndim}"
             )
+        if self._is_mem:
+            # Their eval advances the sequence checker once per policy step, before the action.
+            self._env.env._check_success(inc=True)
         raw_obs, reward, done, info = self._env.step(action)
 
         is_success = self._env.check_success()
         terminated = done or is_success
+        if self._is_mem:
+            # Scored only at the last step, so overshooting (an extra lift) fails the episode.
+            self._t += 1
+            is_success = bool(is_success) and self._t >= self._max_episode_steps
+            terminated = False
         info.update(
             {
                 "task": self.task,
