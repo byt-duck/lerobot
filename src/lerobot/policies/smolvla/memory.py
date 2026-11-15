@@ -8,6 +8,21 @@ from lerobot.policies.pi05.memory import (
     temporal_sinusoidal_embedding,
 )
 
+# long-term semantic memory
+'''
+details:
+- robot episodes w/ subtask language annotations l_{0:T}
+- pass subtask instruction together w/ indicator whether subtask exec failed / succeeded to off-shelf
+pre-trained LLM
+- ask it to summarize all info from previous subtasks that is relevant for finetuning task exec
+- collect output -> use it to label seq for training HL policy
+* instruct LLM to remove / compress info when appropriate
+
+
+issues?
+- where do i get robot episodes with subtask language annotations
+'''
+
 # short-term visual memory, adapted from lerobot/src/lerobot/policies/pi05/memory.py
 def encode_video_with_mem(
     vision_model,  # SmolVLMVisionTransformer
